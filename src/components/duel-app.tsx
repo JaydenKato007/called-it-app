@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import confetti from "canvas-confetti";
 import { Activity, ArrowRight, Check, Copy, Crown, Flame, Plus, Sparkles, Swords, Users, Wallet, X } from "lucide-react";
 import { supabaseBrowser } from "@/lib/supabase-browser";
@@ -10,6 +10,20 @@ type Screen = "home"|"room";
 const db = () => supabaseBrowser();
 const money = (n:number) => n.toLocaleString("en-US");
 const code6 = () => Math.random().toString(36).slice(2,8).toUpperCase();
+const CONFETTI = {particleCount:150,spread:80,startVelocity:45,origin:{y:.6},colors:["#d7fb70","#7c5cff","#22231e","#ffffff"]};
+
+// Remembering who you are on this device, so a refresh drops you back into your
+// seat instead of spawning a second copy of you in the room.
+const SESSION_KEY = "called-it:session";
+type Session = {roomId:string;playerId:string};
+const readSession = ():Session|null => {
+  try { const raw = localStorage.getItem(SESSION_KEY); return raw ? JSON.parse(raw) as Session : null; }
+  catch { return null; }
+};
+const writeSession = (s:Session|null) => {
+  try { if(s) localStorage.setItem(SESSION_KEY,JSON.stringify(s)); else localStorage.removeItem(SESSION_KEY); }
+  catch { /* private mode, blocked storage — the game still works, you just re-join */ }
+};
 
 export function DuelApp(){
   const [screen,setScreen] = useState<Screen>("home");
@@ -40,6 +54,9 @@ export function DuelApp(){
   const [sparkLoading,setSparkLoading] = useState(false);
   const [commentary,setCommentary] = useState("");
   const [commentaryLoading,setCommentaryLoading] = useState(false);
+  const [demoLoading,setDemoLoading] = useState(false);
+  const [restoring,setRestoring] = useState(true);
+  const seenResolved = useRef<Set<string>|null>(null);
 
   const refresh = useCallback(async (roomId:string) => {
     const s=db();
@@ -94,6 +111,7 @@ export function DuelApp(){
       player=data as Player;
     }
     setRoom(r);setMe(player);setScreen("room");setModal(null);setLoading(false);
+    writeSession({roomId:r.id,playerId:player.id});
     await db().from("activity").insert({room_id:r.id,player_id:player.id,message:`${player.avatar} ${player.nickname} joined the room`});
   };
   const createRoom = async () => {
@@ -177,7 +195,6 @@ export function DuelApp(){
       // No winning bets: return all stakes to preserve the point economy.
       for(const b of pool){const pl=players.find(x=>x.id===b.player_id);if(pl)await db().from("players").update({points:pl.points+b.amount}).eq("id",pl.id);}
     }
-    if(winners.some(b=>b.player_id===me.id)) confetti({particleCount:150,spread:80,startVelocity:45,origin:{y:.6},colors:["#d7fb70","#7c5cff","#22231e","#ffffff"]});
     await db().from("predictions").update({status:"resolved",outcome,resolution_note:winners.length?null:"No winning bets — stakes refunded."}).eq("id",p.id);
     const names=winners.map(b=>players.find(x=>x.id===b.player_id)?.nickname).filter(Boolean);
     await say(`${outcome?"✅ YES":"❌ NO"} — “${p.question}” resolved. ${names.length?`Winners: ${names.join(", ")}`:"No winning bets; stakes refunded."}`);
@@ -197,15 +214,62 @@ export function DuelApp(){
     const r=await fetch("/api/commentary",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({kind:"weekly",roomName:room.name,leaderboard:players.map((p,i)=>({rank:i+1,name:p.nickname,points:p.points}))})});
     const j=await r.json();setCommentary(j.text||"The leaderboard has spoken.");setCommentaryLoading(false);
   };
+  // One click into a room that is already mid-game, for anyone arriving on their own.
+  const startDemo = async () => {
+    setDemoLoading(true);setNotice("");
+    try{
+      const r=await fetch("/api/demo",{method:"POST"});
+      const j=await r.json();
+      if(!r.ok||!j.room||!j.player) throw new Error(j.error||"Could not start a demo room.");
+      const player=j.player as Player;
+      writeSession({roomId:j.room.id,playerId:player.id});
+      seenResolved.current=null;
+      setRoom(j.room as Room);setMe(player);setNickname(player.nickname);setAvatar(player.avatar);
+      setScreen("room");setModal(null);
+    }catch(e){ setNotice(e instanceof Error?e.message:"Could not start a demo room."); }
+    setDemoLoading(false);
+  };
   const copyInvite = async () => {
     const link=`${window.location.origin}/?room=${room?.code}`;
     await navigator.clipboard.writeText(link);
     setNotice("Invite link copied!");
   };
   useEffect(()=>{
-    const code=new URLSearchParams(window.location.search).get("room");
-    if(code){setJoinCode(code);setModal("join");}
+    void (async()=>{
+      const code=new URLSearchParams(window.location.search).get("room");
+      const saved=readSession();
+      if(saved){
+        const s=db();
+        const [{data:r},{data:p}]=await Promise.all([
+          s.from("rooms").select("*").eq("id",saved.roomId).maybeSingle(),
+          s.from("players").select("*").eq("id",saved.playerId).maybeSingle()
+        ]);
+        if(r&&p){
+          const player=p as Player;
+          setRoom(r as Room);setMe(player);setNickname(player.nickname);setAvatar(player.avatar);setScreen("room");setRestoring(false);
+          return;
+        }
+        writeSession(null);
+      }
+      if(code){setJoinCode(code);setModal("join");}
+      setRestoring(false);
+    })();
   },[]);
+
+  // Every winner sees their own confetti, not just whoever happened to click Resolve.
+  useEffect(()=>{
+    if(!me) return;
+    if(seenResolved.current===null){
+      seenResolved.current=new Set(predictions.filter(p=>p.status==="resolved").map(p=>p.id));
+      return;
+    }
+    for(const p of predictions){
+      if(p.status!=="resolved"||seenResolved.current.has(p.id)) continue;
+      seenResolved.current.add(p.id);
+      const mine=bets.find(b=>b.prediction_id===p.id&&b.player_id===me.id);
+      if(mine&&mine.choice===p.outcome) confetti(CONFETTI);
+    }
+  },[predictions,bets,me]);
   const betFor=(id:string)=>bets.find(b=>b.prediction_id===id&&b.player_id===me?.id);
   const voteFor=(id:string)=>votes.find(v=>v.prediction_id===id&&v.player_id===me?.id);
   const getPlayer=(id:string)=>players.find(p=>p.id===id);
@@ -214,17 +278,20 @@ export function DuelApp(){
 
   return <main className="min-h-screen">
     <header className="mx-auto flex max-w-6xl items-center justify-between px-4 py-5 md:px-8">
-      <button onClick={()=>{setScreen("home");setRoom(null);setMe(null);setModal(null)}} className="flex items-center gap-2 font-black tracking-tight text-lg"><span className="grid h-9 w-9 place-items-center rounded-xl bg-[#d7fb70]"><Swords size={20}/></span> called<span className="text-[#7c5cff]">it</span></button>
+      <button onClick={()=>{writeSession(null);seenResolved.current=null;setScreen("home");setRoom(null);setMe(null);setModal(null)}} className="flex items-center gap-2 font-black tracking-tight text-lg"><span className="grid h-9 w-9 place-items-center rounded-xl bg-[#d7fb70]"><Swords size={20}/></span> called<span className="text-[#7c5cff]">it</span></button>
       <div className="hidden items-center gap-2 text-xs font-bold text-stone-500 sm:flex"><span className="h-2 w-2 rounded-full bg-lime-500"/>{screen==="room"?"ROOM LIVE":"FRIENDS. POINTS. BRAGGING RIGHTS."}</div>
     </header>
 
-    {screen==="home" ? <section className="mx-auto max-w-6xl px-4 pb-16 pt-5 md:px-8 md:pt-12">
+    {restoring ? <div className="mx-auto grid max-w-6xl place-items-center px-4 py-32"><div className="h-11 w-11 animate-pulse rounded-2xl bg-[#d7fb70]"/></div>
+    : screen==="home" ? <section className="mx-auto max-w-6xl px-4 pb-16 pt-5 md:px-8 md:pt-12">
       <div className="grid items-center gap-10 md:grid-cols-[1.1fr_.9fr]">
         <div className="animate-rise">
           <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-stone-200 bg-white px-3 py-2 text-xs font-extrabold"><Sparkles size={14} className="text-[#7c5cff]"/> YOUR FRIENDS ARE THE PLOT</div>
           <h1 className="max-w-2xl text-5xl font-black leading-[.98] tracking-[-.06em] sm:text-6xl md:text-7xl">How well do you <span className="relative inline-block">know them?<span className="absolute bottom-1 left-0 -z-10 h-4 w-full -rotate-2 bg-[#d7fb70]"/></span></h1>
           <p className="mt-6 max-w-lg text-lg leading-7 text-stone-600">Make predictions about your people. Put points on the line. Wait for reality to expose everybody.</p>
-          <div className="mt-8 flex flex-col gap-3 sm:flex-row"><button className="btn btn-dark" onClick={()=>{setModal("create");setNotice("")}}>Create a room <ArrowRight size={17}/></button><button className="btn btn-outline" onClick={()=>{setModal("join");setNotice("")}}>Join with a code</button></div>
+          <div className="mt-8 flex flex-col gap-3 sm:flex-row"><button className="btn btn-dark" onClick={()=>{setModal("create");setNotice("")}}>Create a room <ArrowRight size={17}/></button><button className="btn btn-lime" onClick={startDemo} disabled={demoLoading}>{demoLoading?"Dealing you in…":"Play a live demo"} <Sparkles size={16}/></button><button className="btn btn-outline" onClick={()=>{setModal("join");setNotice("")}}>Join with a code</button></div>
+          <p className="mt-3 text-sm text-stone-500">On your own? <b className="text-stone-800">Play a live demo</b> drops you straight into a room mid-game — bets open, a vote waiting.</p>
+          {notice&&<p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-900">{notice}</p>}
           <div className="mt-8 flex items-center gap-3 text-sm text-stone-500"><div className="flex -space-x-2">{["🦊","🐸","🐼","🐙"].map(a=><span key={a} className="grid h-9 w-9 place-items-center rounded-full border-2 border-[#f8f7f1] bg-white text-lg">{a}</span>)}</div><span><b className="text-stone-800">No signup.</b> Just your nickname and your receipts.</span></div>
         </div>
         <div className="relative mx-auto w-full max-w-md animate-rise">
